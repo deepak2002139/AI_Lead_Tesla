@@ -139,6 +139,8 @@ make train_gpt2cu
 mpirun -np <number of GPUs> ./train_gpt2cu
 ```
 
+**multi-node training**. For SLURM enabled cluster, use the sample script in [scripts/run_gpt2_1558M.slurm](scripts/run_gpt2_1558M.slurm)
+
 ## experiments / sweeps
 
 Just as an example process to sweep learning rates on a machine with 4 GPUs on TinyStories. Run a shell script `sweep.sh` (after you of course `chmod u+x sweep.sh`):

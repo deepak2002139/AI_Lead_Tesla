@@ -1693,7 +1693,7 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_sum(val_loss, model.loss_buffer, &multi_gpu_config) / multi_gpu_config.num_processes;
+            val_loss = multi_gpu_float_sum(val_loss, model.loss_buffer, &multi_gpu_config) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
@@ -1712,7 +1712,7 @@ int main(int argc, char *argv[]) {
                 eval_acc_norm += (float)correct;
             }
             // careful because not all ranks may have the exact same allocation of number of examples
-            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            eval_acc_norm = multi_gpu_float_sum(eval_acc_norm, model.loss_buffer, &multi_gpu_config);
             printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
             logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
         }

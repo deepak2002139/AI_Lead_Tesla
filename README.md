@@ -139,7 +139,7 @@ make train_gpt2cu
 mpirun -np <number of GPUs> ./train_gpt2cu
 ```
 
-**multi-node training**. For SLURM enabled cluster, use the sample script in [scripts/run_gpt2_1558M.slurm](scripts/run_gpt2_1558M.slurm)
+**multi-node training**. For SLURM enabled cluster, use the sample script in [scripts/run_gpt2_124M.sbatch](scripts/run_gpt2_124M.sbatch)
 
 ## experiments / sweeps
 

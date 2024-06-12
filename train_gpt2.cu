@@ -1067,6 +1067,7 @@ float multi_gpu_float_sum(float value, float *unified_buffer, const MultiGpuConf
         cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), multi_gpu_config->local_device_idx, 0));
         ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
         cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), cudaCpuDeviceId, 0));
+        cudaCheck(cudaDeviceSynchronize());
         return *unified_buffer;
     }
     // note MPI doesn't support all reduce with mean, only sum

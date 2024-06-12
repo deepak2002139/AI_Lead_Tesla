@@ -63,7 +63,6 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/global_norm.cuh"
 // ----------- Multi-GPU support -----------
 #ifdef MULTI_GPU
-#include <mpi.h>
 #include <nccl.h>
 #endif
 
@@ -92,28 +91,14 @@ void nccl_check(ncclResult_t status, const char *file, int line) {
 }
 #define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
 
-void mpi_check(int status, const char *file, int line) {
-    if (status != MPI_SUCCESS) {
-        char mpi_error[4096];
-        int mpi_error_len = 0;
-        assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS);
-        printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len, mpi_error);
-        exit(EXIT_FAILURE);
-    }
-}
-#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-
 #endif // MULTI_GPU
 
 // ----------------------------------------------------------------------------
-// MPI / multi-processing setup
-
 // Parameters specific to training on multiple GPUs.
 typedef struct {
-    bool slurm_managed;
-    int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
+    int process_rank;      // Rank of this process among all processes launched. 0 if no multi-GPU.
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
-    int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
+    int device_idx;        // This process GPU index on current machine. 0 if no multi-GPU.
 
     // Zero Redundancy Optimizer stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
     int zero_stage;        // 0-Disabled, 1-OSS, 2-SDP, 3-FSDP
@@ -127,52 +112,37 @@ typedef struct {
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
 
-MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
+MultiGpuConfig multi_gpu_config_init(int num_processes, int process_rank, int gpus_per_node, char *dfs_path) {
 #ifdef MULTI_GPU
     MultiGpuConfig result;
     ncclUniqueId nccl_id;
 
-    char *slurm_job_id = getenv("SLURM_JOB_ID");
-    if (slurm_job_id != NULL) {
-        result.slurm_managed = true;
-        result.process_rank = atoi(getenv("SLURM_PROCID"));
-        result.num_processes = atoi(getenv("SLURM_NTASKS"));
-        result.local_device_idx = atoi(getenv("SLURM_LOCALID"));
+    result.process_rank = process_rank;
+    result.num_processes = num_processes;
+    result.device_idx = process_rank % gpus_per_node;
 
-        char *dfs_path = getenv("DFS_PATH");
-        assert(dfs_path != NULL);
-        FILE* idFile;
-        static char filename[256];
-        snprintf(filename, sizeof(filename), "%s/ncclUniqueId_%s.dat", dfs_path, slurm_job_id);
+    FILE* idFile;
+    static char filename[256];
+    snprintf(filename, sizeof(filename), "%s/ncclUniqueId.dat", dfs_path);
 
-        if (result.process_rank == 0) { // Generate the NCCL unique ID at rank 0 and write it to a file
-            ncclCheck(ncclGetUniqueId(&nccl_id));
-            idFile = fopen(filename, "wb");
-            assert(idFile != NULL);
-            fwrite(&nccl_id, sizeof(nccl_id), 1, idFile);
-            fclose(idFile);            
-        } else {                        // Other ranks wait until the file is available and read the unique ID
-            do {
-                usleep(1000000);
-                idFile = fopen(filename, "rb");
-                if (idFile != NULL) break;
-            } while (idFile == NULL);
-            fread(&nccl_id, sizeof(nccl_id), 1, idFile);
-            fclose(idFile);
-        }
-        printf("Started Multi Node training managed by Slurm: " );
-    } else {
-        result.slurm_managed = false;
-        mpiCheck(MPI_Init(argc, argv));
-        mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
-        mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
-        result.local_device_idx = result.process_rank;
-        if (result.process_rank == 0) ncclCheck(ncclGetUniqueId(&nccl_id));
-        mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
-        printf("Started Single Node training managed by MPI: " );
+    if (result.process_rank == 0) { // Generate the NCCL unique ID at rank 0 and write it to a file
+        ncclCheck(ncclGetUniqueId(&nccl_id));
+        idFile = fopen(filename, "wb");
+        assert(idFile != NULL);
+        fwrite(&nccl_id, sizeof(nccl_id), 1, idFile);
+        fclose(idFile);            
+    } else {                        // Other ranks wait until the file is available and read the unique ID
+        do {
+            usleep(1000000);
+            idFile = fopen(filename, "rb");
+            if (idFile != NULL) break;
+        } while (idFile == NULL);
+        fread(&nccl_id, sizeof(nccl_id), 1, idFile);
+        fclose(idFile);
     }
-    printf("ProcessID:%d, NumProcess::%d, DeviceId:%d\n", result.process_rank, result.num_processes, result.local_device_idx);
-    cudaCheck(cudaSetDevice(result.local_device_idx));
+
+    printf("ProcessID:%d, NumProcess::%d, DeviceId:%d\n", result.process_rank, result.num_processes, result.device_idx);
+    cudaCheck(cudaSetDevice(result.device_idx));
     ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
     return result;
 #else
@@ -181,7 +151,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
-    result.local_device_idx = 0;
+    result.device_idx = 0;
     return result;
 #endif
 }
@@ -189,23 +159,16 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
 void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
-    if (!multi_gpu_config->slurm_managed) {
-        mpiCheck(MPI_Finalize());
-    }
 #endif
 }
 
 void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config, float *unified_buffer) {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes > 1) {
-        if (!multi_gpu_config->slurm_managed) { // dummy nccl call to sync process
-            ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));            
-        }
-        else {
-            mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
-        }
+        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
     }
 #endif
+    cudaCheck(cudaDeviceSynchronize());
 }
 
 // convenience function that only prints if the rank of process is zero
@@ -1061,19 +1024,13 @@ float multi_gpu_float_sum(float value, float *unified_buffer, const MultiGpuConf
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes == 1) return value;
 
-    if (multi_gpu_config->slurm_managed) {  //If the process is managed by slurm we don't need to use MPI
-        if (unified_buffer == NULL) cudaCheck(cudaMallocManaged(&unified_buffer, sizeof(float)));
-        *unified_buffer = value;
-        cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), multi_gpu_config->local_device_idx, 0));
-        ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
-        cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), cudaCpuDeviceId, 0));
-        cudaCheck(cudaDeviceSynchronize());
-        return *unified_buffer;
-    }
-    // note MPI doesn't support all reduce with mean, only sum
-    float result;
-    mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result;
+    if (unified_buffer == NULL) cudaCheck(cudaMallocManaged(&unified_buffer, sizeof(float)));
+    *unified_buffer = value;
+    cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), multi_gpu_config->device_idx, 0));
+    ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
+    cudaCheck(cudaMemPrefetchAsync(unified_buffer, sizeof(float), cudaCpuDeviceId, 0));
+    cudaCheck(cudaDeviceSynchronize());
+    return *unified_buffer;
 #else
     return value;
 #endif
@@ -1297,10 +1254,10 @@ void gpt2_free(GPT2 *model) {
 void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
 
     // get CUDA device infos
-    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.device_idx);
     if (print_device_info) {
         printf("[System]\n");
-        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
+        printf("Device %d: %s\n", multi_gpu_config.device_idx, deviceProp.name);
     }
 
     // set up the cuda streams. atm everything is on the single main stream
@@ -1445,7 +1402,6 @@ void error_usage() {
 // ----------------------------------------------------------------------------
 // main training loop
 int main(int argc, char *argv[]) {
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
@@ -1472,10 +1428,14 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int num_processes = 1;
+    int process_rank = 0;
+    int gpus_per_node = 8;
+    char dfs_path[256] = ".";
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
         if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
         else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
@@ -1501,8 +1461,15 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'd') { strcpy(dfs_path, argv[i+1]); }
         else { error_usage(); }
     }
+
+    multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, dfs_path);
+
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {

@@ -9,15 +9,15 @@
 cd /dfs/llm.c/                                      # path to the repo in distributed file system
 mkdir -p log124M
 
-export DFS_PATH="/dfs/llm.c/log124M"                # this path will be used to save nccl unique id and sync it between processes
 # export NCCL_SOCKET_IFNAME=ib0                     # network interface Ethernet or InifiniBand which enables gpu direct rdma
 # export NCCL_IB_HCA=mlx5_0,mlx5_1                  # list of all InfiniBand devices available if available
 
 # GPT-2 (124M) repro on FineWeb100B
-# Batch size is set to (1024 * 64) * 32
-srun ./train_gpt2cu \
-    -i "dev/data/fineweb100B/fineweb_train_*.bin" \
-    -j "dev/data/fineweb100B/fineweb_val_*.bin" \
+# Global batch size is set to (1024 * 64) * 32
+srun bash -c "
+    ./train_gpt2cu \
+    -i 'dev/data/fineweb100B/fineweb_train_*.bin' \
+    -j 'dev/data/fineweb100B/fineweb_val_*.bin' \
     -o "log124M" \
     -v 250 -s 20000 -g 144 \
     -h 1 \
@@ -31,4 +31,8 @@ srun ./train_gpt2cu \
     -u 700 \
     -n 10000 \
     -y 1 \
-    -e "d12"
+    -e d12 \
+    -pn 32 \
+    -pr \$SLURM_PROCID \
+    -pg 8 \
+    -pd "/dfs/llm.c/log124M""

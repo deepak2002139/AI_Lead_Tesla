@@ -165,6 +165,7 @@ void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config, float *unified_buffer) {
 #ifdef MULTI_GPU
     if (multi_gpu_config->num_processes > 1) {
+        if (unified_buffer == NULL) cudaCheck(cudaMallocManaged(&unified_buffer, sizeof(float)));
         ncclCheck(ncclAllReduce(unified_buffer, unified_buffer, sizeof(float), ncclFloat, ncclSum, multi_gpu_config->nccl_comm, 0));
     }
 #endif

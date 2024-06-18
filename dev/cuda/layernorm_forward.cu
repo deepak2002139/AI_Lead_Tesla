@@ -29,8 +29,6 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-#define WARP_SIZE 32
-
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -184,12 +182,11 @@ __global__ void normalization_kernel(float* out, const float* inp, float* mean, 
 __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
+    int warpsPerBlock = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    int idx = blockIdx.x * warpsPerBlock + warpId;
+    if (idx >= N) {
         return;
     }
 
@@ -198,35 +195,36 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
 
     // mean
     float sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = laneId; i < C; i += warpSize) {
         sum += x[i];
     }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = warpReduceSum(sum);
     float m = sum / C;
-    if(warp.thread_rank() == 0 && mean != nullptr) {
+    if (laneId == 0 && mean != nullptr) {
         __stcs(mean + idx, m);
     }
 
     // rstd
     sum = 0.0f;
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    for (int i = laneId; i < C; i += warpSize) {
         float diff = x[i] - m;
         sum += diff * diff;
     }
-    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    sum = warpReduceSum(sum);
     float s = rsqrtf(sum / C + 1e-5f);
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
+    if (laneId == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
 
     // final normalization and scaling by weight/bias
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+    for (int c = laneId; c < C; c += warpSize) {
         // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+        // indicating that this data will not be reused soon, and can be
+        // streamed through the caches this allows the threads to get more
+        // cache-hits for the (shared) weight and bias parameters
+        float n = s * (__ldcs(x + c) - m);
+        __stcs(o + c, n * weight[c] + bias[c]);
     }
 }
 
@@ -234,11 +232,11 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
 __global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N) {
+    int warpsPerBlock = blockDim.x / warpSize;
+    int warpId = threadIdx.x / warpSize;
+    int laneId = threadIdx.x % warpSize;
+    int idx = blockIdx.x * warpsPerBlock + warpId;
+    if (idx >= N) {
         return;
     }
 
@@ -246,37 +244,34 @@ __global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __rest
     const float* x = inp + idx * C;
 
     // thread coarsening through the row, reduce the sum in series
-    float sum = 0.0; // stores sum(x)
-    float sum2 = 0.0; // stores sum(x**2)
-    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+    float sum1 = 0.0;  // stores sum(x)
+    float sum2 = 0.0;  // stores sum(x**2)
+    for (int i = laneId; i < C; i += warpSize) {
         float xi = x[i];
-        sum += xi;
+        sum1 += xi;
         sum2 += xi * xi;
     }
     // warp-level reduction at the end
-    sum = cg::reduce(warp, sum, cg::plus<float>{}); // sum(x)
-    sum2 = cg::reduce(warp, sum2, cg::plus<float>{}); // sum(x**2)
-    sum /= C; // mean(x)
-    sum2 /= C; // mean(x**2)
+    float mean1 = warpReduceSum(sum1) / C;  // mean(x)
+    float mean2 = warpReduceSum(sum2) / C;  // mean(x**2)
 
     // mean, var, rstd
-    float m = sum;
-    float var = sum2 - sum * sum;
+    float var = mean2 - mean1 * mean1;
     float s = rsqrtf(var + 1e-5f);
 
     // store the mean, no need to cache it
-    if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
+    if (laneId == 0 && mean != nullptr) {
+        __stcs(mean + idx, mean1);
     }
     // store the rstd, no need to cache it
-    if(warp.thread_rank() == 0 && rstd != nullptr) {
+    if (laneId == 0 && rstd != nullptr) {
         __stcs(rstd + idx, s);
     }
     // final normalization and scaling by weight/bias
     float* o = out + idx * C;
-    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
-        float n = s * (__ldcs(x+c) - m);
-        __stcs(o+c, n * weight[c] + bias[c]);
+    for (int c = laneId; c < C; c += warpSize) {
+        float n = s * (__ldcs(x + c) - mean1);
+        __stcs(o + c, n * weight[c] + bias[c]);
     }
 }
 
@@ -284,9 +279,6 @@ __global__ void layernorm_forward_kernel4(float* __restrict__ out, float* __rest
 __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const float*  __restrict__ inp, const float*  __restrict__ weight,
                                     const float* __restrict__ bias, int N, int C) {
-    namespace cg = cooperative_groups;
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float shared_sum[32]; // block_size max is 1024 = 32 * 32 warps
     __shared__ float shared_sum2[32]; // warps will be writing into shared memeory after warp-reduce
     int num_warps = blockDim.x / 32;
@@ -305,8 +297,8 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
         thread_sum2 += xi * xi;
     }
     // warp-level reduction
-    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>{}); // sum(x)
-    float warp_sum2 = cg::reduce(warp, thread_sum2, cg::plus<float>{}); // sum(x**2)
+    float warp_sum = warpReduceSum(thread_sum);
+    float warp_sum2 = warpReduceSum(thread_sum2);
     // store the warp-level reduction in shared memory (we could have lane_id == 0 guard but not needed)
     shared_sum[warp_id] = warp_sum;
     shared_sum2[warp_id] = warp_sum2;
@@ -315,8 +307,8 @@ __global__ void layernorm_forward_kernel5(float* __restrict__ out, float* __rest
     warp_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0f;
     warp_sum2 = (lane_id < num_warps) ? shared_sum2[lane_id] : 0.0f;
     // now reduce the warp-level reductions
-    float block_sum = cg::reduce(warp, warp_sum, cg::plus<float>{}); // sum(x)
-    float block_sum2 = cg::reduce(warp, warp_sum2, cg::plus<float>{}); // sum(x**2)
+    float block_sum = warpReduceSum(warp_sum); // sum(x)
+    float block_sum2 = warpReduceSum(warp_sum2); // sum(x**2)
     // mean, var, rstd
     block_sum /= C; // mean(x)
     block_sum2 /= C; // mean(x**2)
@@ -415,6 +407,56 @@ __global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __rest
     }
 }
 
+// Combines the merits of kernel 4 and kernel 6
+__global__ void layernorm_forward_kernel7(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    float eps = 1e-5f;
+    extern __shared__ x128 xShared[];
+    // only use smem store the input data, since weight and bias are only used once in the end
+    // therefore is unnecessary to cache them
+    x128* const xSharedWarp = xShared + threadIdx.y * C / x128::size;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row < N) {
+        const float* const x = inp + row * C;
+        float* const y = out + row * C;
+        float warpSum = 0.0f, warpSum2 = 0.0f;
+
+        for (int i = threadIdx.x * x128::size; i < C; i += WARP_SIZE * x128::size) {
+            x128 xi = load128cs(x + i);
+            xSharedWarp[i / x128::size] = xi;
+            for (int k = 0; k < x128::size; ++k) {
+                warpSum += xi[k];
+                warpSum2 += xi[k] * xi[k];
+
+            }
+        }
+
+        float mean1 = warpReduceSum(warpSum) / C;
+        float mean2 = warpReduceSum(warpSum2) / C;
+
+        if (threadIdx.x == 0 && mean != nullptr) __stcs(mean + row, mean1);
+
+        float var = (mean2 - mean1 * mean1);
+
+        float invStd = rsqrtf(var + eps);
+
+        if (threadIdx.x == 0 && rstd != nullptr) __stcs(rstd + row, invStd);
+
+        // load from smem for accleration
+        for (int i = threadIdx.x * x128::size; i < C; i += WARP_SIZE * x128::size) {
+            x128 w = load128cs(weight + i);
+            x128 b = load128cs(bias + i);
+            x128 _x = xSharedWarp[i / x128::size];
+            x128 _out;
+            for (int k = 0; k < x128::size; ++k) {
+                _out[k] = w[k] * invStd * ((float)_x[k] - mean1) + b[k];
+            }
+            store128cs(y + i, _out);
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -504,6 +546,25 @@ void layernorm_forward6(float* out, float* mean, float* rstd,
     cudaCheck(cudaGetLastError());
 }
 
+void layernorm_forward7(float* out, float* mean, float* rstd, const float* inp,
+                        const float* weight, const float* bias, int B, int T,
+                        int C, const int block_size) {
+    assert(block_size % 32 == 0);
+    const int maxBlockSizeKernel7 = 512;
+    const int N = B * T;
+    dim3 blockDim(WARP_SIZE, block_size / WARP_SIZE);
+    dim3 gridDim(ceil_div(N * 32, block_size));
+    size_t smemSize = C * sizeof(float) * (block_size / 32);
+    cudaError_t status = cudaFuncSetAttribute(layernorm_forward_kernel7, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+    if (status != cudaSuccess) {
+        blockDim = dim3(WARP_SIZE, maxBlockSizeKernel7 / WARP_SIZE);
+        gridDim = dim3(ceil_div(N * 32, maxBlockSizeKernel7));
+        smemSize = C * sizeof(float) * (maxBlockSizeKernel7 / 32);
+    } 
+    layernorm_forward_kernel7<<<gridDim, blockDim, smemSize>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // kernel version dispatch
 void layernorm_forward(int kernel_num,
                     float* out, float* mean, float* rstd,
@@ -528,6 +589,9 @@ void layernorm_forward(int kernel_num,
             break;
         case 6:
             layernorm_forward6(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+            break;
+        case 7:
+            layernorm_forward7(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
